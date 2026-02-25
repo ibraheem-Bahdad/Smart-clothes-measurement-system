@@ -1,4 +1,9 @@
+import ctypes
+import os
+import platform
 import time
+from importlib import resources
+from pathlib import Path
 
 import cv2
 import mediapipe as mp
@@ -25,7 +30,8 @@ from calculations import (
 from data_sheet_decision import best_size
 
 # ---------------- CONFIG ----------------
-MODEL_PATH = "pose_landmarker_lite.task"
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = BASE_DIR / "pose_landmarker_lite.task"
 WINDOW_NAME = "Smart Mirror - T-Shirt Size"
 
 MEASURE_SECONDS = 5.0
@@ -60,7 +66,7 @@ ALIGN_SHOULDER_TOL_IN = 0.3
 ALIGN_CENTER_X_TOL = 0.02
 ALIGN_SLOPE_TOL = 0.05
 
-CALIBRATION_PATH = "device_calibration.json"
+CALIBRATION_PATH = BASE_DIR / "device_calibration.json"
 BTN_W = 220
 BTN_H = 42
 BTN_MARGIN = 16
@@ -114,6 +120,49 @@ smoothed_length_px = None
 calib_step_index = 0
 calib_step_results = {}
 latest_alignment_ratio = None
+
+
+def apply_mediapipe_windows_compat():
+    """Work around MediaPipe Windows builds missing libmediapipe.free()."""
+    if os.name != "nt":
+        return
+
+    from mediapipe.tasks.python.core import mediapipe_c_bindings
+
+    if getattr(mediapipe_c_bindings, "_smart_mirror_compat_patched", False):
+        return
+
+    def load_raw_library_compat(signatures=()):
+        if mediapipe_c_bindings._shared_lib is None:
+            if os.name == "posix":
+                if platform.system() == "Darwin":
+                    lib_filename = "libmediapipe.dylib"
+                else:
+                    lib_filename = "libmediapipe.so"
+            else:
+                lib_filename = "libmediapipe.dll"
+            lib_path_context = resources.files("mediapipe.tasks.c")
+            absolute_lib_path = str(lib_path_context / lib_filename)
+            mediapipe_c_bindings._shared_lib = ctypes.CDLL(absolute_lib_path)
+
+        for signature in signatures:
+            c_func = getattr(mediapipe_c_bindings._shared_lib, signature.func_name)
+            c_func.argtypes = signature.argtypes
+            c_func.restype = signature.restype
+
+        try:
+            mediapipe_c_bindings._shared_lib.free.argtypes = [ctypes.c_void_p]
+            mediapipe_c_bindings._shared_lib.free.restype = None
+        except AttributeError:
+            msvcrt = ctypes.CDLL("msvcrt.dll")
+            mediapipe_c_bindings._shared_lib.free = msvcrt.free
+            mediapipe_c_bindings._shared_lib.free.argtypes = [ctypes.c_void_p]
+            mediapipe_c_bindings._shared_lib.free.restype = None
+
+        return mediapipe_c_bindings._shared_lib
+
+    mediapipe_c_bindings.load_raw_library = load_raw_library_compat
+    mediapipe_c_bindings._smart_mirror_compat_patched = True
 
 
 def on_mouse(event, x, y, flags, param):
@@ -412,6 +461,11 @@ def run():
     global calib_step_index, calib_step_results
     global latest_alignment_ratio
 
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(f"Unable to open file at {MODEL_PATH}")
+
+    apply_mediapipe_windows_compat()
+
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         raise RuntimeError("Camera not opened.")
@@ -446,7 +500,7 @@ def run():
     latest_alignment_ratio = None
 
     options = vision.PoseLandmarkerOptions(
-        base_options=python.BaseOptions(model_asset_path=MODEL_PATH),
+        base_options=python.BaseOptions(model_asset_path=str(MODEL_PATH)),
         running_mode=vision.RunningMode.LIVE_STREAM,
         num_poses=1,
         result_callback=callback,
